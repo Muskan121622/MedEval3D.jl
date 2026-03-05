@@ -1,9 +1,10 @@
 module CUDAGpuUtils
 
 
-using CUDA, StaticArrays
+using KernelAbstractions, StaticArrays
+using CUDA
 
-export syncThreadsAnd,gridDimX,atomicallySetValueTrreeDim,atomicallyAddOneInt,clearLocArrdefineIndicies,computeBlocksFromOccupancy,reduce_warp,getKernelContants,assignWorkToCooperativeBlocks,getMaxBlocksPerMultiproc,reduce_warp_max,reduce_warp_min,reduce_warp_min,reduce_warp_or,reduce_warp_and,blockIdxZ,blockIdxY,blockIdxX,blockDimZ, blockDimY, blockDimX, threadIdxX, threadIdxY, threadIdxZ
+export syncThreadsAnd,gridDimX,atomicallySetValueTrreeDim,atomicallyAddOneInt,clearLocArrdefineIndicies,computeBlocksFromOccupancy,reduce_warp,getKernelContants,assignWorkToCooperativeBlocks,getMaxBlocksPerMultiproc,reduce_warp_max,reduce_warp_min,reduce_warp_min,reduce_warp_or,reduce_warp_and
 export @unroll, @ifX, @ifY, @ifXY, @widL, @wid, @lan,getThreadsAndBlocksNumbForKernel
 
 
@@ -11,30 +12,27 @@ export @unroll, @ifX, @ifY, @ifXY, @widL, @wid, @lan,getThreadsAndBlocksNumbForK
 convinience macro that will execute only if it has given thread Id X
 """
 macro ifX(x, ex)
-    return esc(:(if threadIdxX()==$x
+    return esc(:(if (@index(Local, X)) == $x
         $ex
     end))
-
 end
 
 """
 convinience macro that will execute only if it has given thread Id Y
 """
 macro ifY(y, ex)
-    return esc(:(if threadIdxY()==$y 
+    return esc(:(if (@index(Local, Y)) == $y 
         $ex
     end))
-
 end
 
 """
-convinience macro that will execute only if it has given thread Id Y
+convinience macro that will execute only if it has given thread Id XY
 """
 macro ifXY(x,y, ex)
-        return esc(:(if threadIdxY()==$y && threadIdxX()==$x
+        return esc(:(if (@index(Local, Y)) == $y && (@index(Local, X)) == $x
             $ex
         end))
-
 end
 """
 convinience macro that will execute only if it has given wid and lane 
@@ -85,74 +83,40 @@ function defineBlocks(::Type{maskNumb}
 end#defineBlocks
 
 """
-wrapper to get x coordinates of thread
+wrapper to get coordinates/dimensions. These should be used within @kernel.
 """
-function threadIdxX()::UInt32
-    threadIdx().x
+@inline function threadIdxX()
+    return @index(Local, X)
 end
-"""
-wrapper to get y coordinates of thread
-"""
-function threadIdxY()::UInt32
-    threadIdx().y
+@inline function threadIdxY()
+    return @index(Local, Y)
 end
-"""
-wrapper to get x coordinates of thread
-"""
-function threadIdxZ()::UInt32
-    threadIdx().z
+@inline function threadIdxZ()
+    return @index(Local, Z)
 end
 
-
-
-
-
-
-"""
-wrapper to get x dimension of thread block
-"""
-function blockDimX()::UInt32
-    blockDim().x
+@inline function blockDimX()
+    return @groupsize()[1]
 end
-"""
-wrapper to get y dimension of thread block
-"""
-function blockDimY()::UInt32
-    blockDim().y
+@inline function blockDimY()
+    return @groupsize()[2]
 end
-"""
-wrapper to get x dimension of thread block
-"""
-function blockDimZ()::UInt32
-    blockDim().z
+@inline function blockDimZ()
+    return @groupsize()[3]
 end
 
-
-
-"""
-wrapper to get x coordinates of thread block
-"""
-function blockIdxX()::UInt32
-    blockIdx().x
+@inline function blockIdxX()
+    return @index(Group, X)
 end
-"""
-wrapper to get y coordinates of thread block
-"""
-function blockIdxY()::UInt32
-    blockIdx().y
+@inline function blockIdxY()
+    return @index(Group, Y)
 end
-"""
-wrapper to get x coordinates of thread block
-"""
-function blockIdxZ()::UInt32
-    blockIdx().z
+@inline function blockIdxZ()
+    return @index(Group, Z)
 end
 
-"""
-wrapper to get x length of grid - how many thread blocks in x dimension
-"""
-function gridDimX()::UInt32
-    gridDim().x
+@inline function gridDimX()
+    return @numgroups()[1]
 end
 
 """
@@ -193,10 +157,10 @@ function computeBlocksFromOccupancy(args, int32Shemm)
     end
     compute_shmem(threads) = Int64((threads/32)*int32Shemm*sizeof(Int32) )
     
-       kernel = @cuda launch=false getBlockTpFpFn(args...) 
-       kernel_config = launch_configuration(kernel.fun; shmem=compute_shmem∘compute_threads)
-       blocks =  kernel_config.blocks
-       threads =  kernel_config.threads
+       # kernel = @cuda launch=false getBlockTpFpFn(args...) 
+       # kernel_config = launch_configuration(kernel.fun; shmem=compute_shmem * compute_threads)
+       blocks = 128
+       threads = 256
        maxBlocks = attribute(device(), CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
     
 return blocks,threads,maxBlocks
@@ -323,8 +287,9 @@ kernelFun - the function describing kernel
 
 """
 function getMaxBlocksPerMultiproc(args,kernelFun )
- kernel = @cuda launch=false kernelFun(args...) 
-return CUDA.active_blocks(kernel.fun, 512)  
+ # Note: CUDA occupancy API not available in KernelAbstractions
+ # Returning a reasonable default
+ return 128 
 end#getMaxBlocksPerMultiproc
 
 
@@ -386,21 +351,33 @@ args - arguments tuple  for kernel function
 reurn 2 tuple with optimal threads and blocks number (threads,blocks)
 """
 function getThreadsAndBlocksNumbForKernel(get_shmemm,kernelFun,args)
-    # calculate the amount of dynamic shared memory for a 2D block size
-    #get_shmem(threads) = (sizeof(UInt32)*3*4)
+    # Note: This function uses CUDA-specific occupancy API
+    # For KernelAbstractions, we need a different approach
+    # For now, return default values
     
-    function get_threads(threads)
-        threads_x = 32
-        threads_y = cld(threads,threads_x )
-        return (threads_x, threads_y)
-    end
-
-    kernel = @cuda launch=false kernelFun(args...)
-   
-    config = launch_configuration(kernel.fun, shmem=threads->get_shmemm(get_threads(threads)))
-    threads = get_threads(config.threads)
-    blocks = UInt32(config.blocks)
-    return (threads,blocks)
+    # Default configuration
+    threads_x = 32
+    threads_y = 8  # 256 threads total
+    threads = (threads_x, threads_y)
+    
+    # Estimate blocks based on typical GPU
+    blocks = UInt32(128)  # Default number of blocks
+    
+    return (threads, blocks)
+    
+    # Original CUDA-specific code (commented out):
+    # function get_threads(threads)
+    #     threads_x = 32
+    #     threads_y = cld(threads,threads_x )
+    #     return (threads_x, threads_y)
+    # end
+    # 
+    # kernel = @cuda launch=false kernelFun(args...)
+    # 
+    # config = launch_configuration(kernel.fun, shmem=threads->get_shmemm(get_threads(threads)))
+    # threads = get_threads(config.threads)
+    # blocks = UInt32(config.blocks)
+    # return (threads,blocks)
 end
 
 

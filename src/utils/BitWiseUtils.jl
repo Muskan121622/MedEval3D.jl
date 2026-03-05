@@ -28,7 +28,7 @@ set bit of number numb in position pos to value val
 """
 macro setBitTo(numb,pos,val)
     return esc(quote
-    # Suppose you want to change bit N of x, where N=0 means the least-significant bit. You don’t care what the old value was, but the new value is B (either 0 or 1). This will do the trick:
+    # Suppose you want to change bit N of x, where N=0 means the least-significant bit. You don't care what the old value was, but the new value is B (either 0 or 1). This will do the trick:
      ($numb) =(($numb) & ~(1<<($pos-1))) | ($(val)<<($pos-1))
     end)
   
@@ -78,9 +78,9 @@ function bitDilatateUINt(x::UInt32)::UInt32
 end
 
 """
-Given 32 bit integers x  and y  i would like to set bits of x to 1 if in corresponding position of y there is 1  without modyfing other bits of y 
-    So for example  if x is 1 0 0 0 0 1 ...And y is 0 0 0 1 0 0  ...
-    I would like a result that would be  1 0 0 1 0 1 
+Given 32 bit integers x and y i would like to set bits of x to 1 if in corresponding position of y there is 1 without modyfing other bits of y 
+    So for example if x is 1 0 0 0 0 1 ...And y is 0 0 0 1 0 0  ...
+    I would like a result that would be  1 0 0 1 0 1 
 """
 macro bitPassOnes(source,target)
     return esc(quote

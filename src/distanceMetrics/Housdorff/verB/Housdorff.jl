@@ -6,17 +6,19 @@ module Housdorff
 using CUDA
 using ..CUDAGpuUtils ,..IterationUtils,..ReductionUtils , ..MemoryUtils,..CUDAAtomicUtils
 using ..BitWiseUtils,..MetadataAnalyzePass,..MetaDataUtils,..WorkQueueUtils,..ProcessMainDataVerB,..HFUtils,..ResultListUtils,..PrepareArrtoBool, ..MainLoopKernel,..ScanForDuplicates
-export get_shmemMainKernel, getHousedorffDistance,boolKernelLoad,mainKernelLoad,get_shmemMainKernel,get_shmemBoolKernel,preparehousedorfKernel
+export getHousedorffDistance,boolKernelLoad,mainKernelLoad,get_shmemMainKernel,get_shmemBoolKernel,preparehousedorfKernel
 """
 calculate housedorff distance of given arrays with given robustness percentage
 
 """
-function getHousedorffDistance(goldGPUa,segmGPUa,boolKernelArgs,mainKernelArgs,threadsBoolKern,blocksBoolKern ,threadsMainKern,blocksMainKern,shmemSizeBool,shmemSizeMain)
-    # boolKernelArgs[1]= goldGPU
-    # boolKernelArgs[2]= segmGPU
+    backend = KernelAbstractions.get_backend(goldGPUa)
+    kernel = getBoolCube_kernel(backend)
+    
+    # Unpack boolKernelArgs for kernel call
     mainArrDims,dataBdim,metaData,metaDataDims,reducedGoldA,reducedSegmA,loopXinPlane,loopYinPlane,minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp ,numberToLooFor,inBlockLoopXZIterWithPadding,shmemblockDataLoop,shmemblockDataLenght,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength = boolKernelArgs
 
-    @cuda threads=threadsBoolKern blocks=blocksBoolKern shmem=shmemSizeBool  cooperative=true boolKernelLoad(goldGPUa,segmGPUa,boolKernelArgs...)
+    kernel(goldGPUa, segmGPUa, numberToLooFor, reducedGoldA, reducedSegmA, fn, fp, minxRes, maxxRes, minyRes, maxyRes, minzRes, maxzRes, dataBdim, metaData, metaDataDims, mainArrDims, loopMeta, metaDataLength, inBlockLoopX, inBlockLoopY, inBlockLoopZ; ndrange=(blocksBoolKern * threadsBoolKern[1] * threadsBoolKern[2]), workgroupsize=(threadsBoolKern[1] * threadsBoolKern[2]))
+    KernelAbstractions.synchronize(backend)
     #now time to get data structures dependent on bool kernel like for example loading subsections of meta data, creating work queue ...
     #some arrays needs to be instantiated only after we know the number of the false and true positives
     metaData,reducedGoldA  ,reducedSegmA ,paddingStore,resList,workQueue,workQueueCounter= getBigGPUForHousedorffAfterBoolKernel(metaData,minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp,reducedGoldA,reducedSegmA,dataBdim)
@@ -27,16 +29,21 @@ function getHousedorffDistance(goldGPUa,segmGPUa,boolKernelArgs,mainKernelArgs,t
     referenceArrs=(segmGPUa,goldGPUa )
        
     #main calculations
-    @cuda threads=threadsMainKern blocks=blocksMainKern shmem=shmemSizeMain cooperative=true mainKernelLoadB( referenceArrs,dilatationArrs, mainArrDims,dataBdim
-    ,numberToLooFor,metaDataDims,metaData,iterThrougWarNumb,robustnessPercent
-    ,shmemSumLengthMaxDiv4,globalFpResOffsetCounter,globalFnResOffsetCounter
-    ,globalIterationNumber,globalCurrentFnCount,globalCurrentFpCount
-    ,globalIterationNumb,workQueue,workQueueCounter
-    ,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed
-    ,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY
-    ,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop
-    ,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength, fn,fp,resList,inBlockLoopXZIterWithPadding,paddingStore,shmemblockDataLenght,shmemblockDataLoop)
-        #@cuda threads=threadsMainKern blocks=blocksMainKern shmem=shmemSizeMain cooperative=true mainKernelLoad(dilatationArrs,referenceArrs, mainArrDims,dataBdim,numberToLooFor,metaDataDims,metaData,iterThrougWarNumb,robustnessPercent,shmemSumLengthMaxDiv4,globalFpResOffsetCounter,globalFnResOffsetCounter,globalIterationNumber,globalCurrentFnCount,globalCurrentFpCount,globalIterationNumb,workQueaue,resList,resListIndicies,maxResListIndex,inBlockLoopXZIterWithPadding,shmemblockDataLoop,shmemblockDataLenght,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength, fn,fp)
+    main_kernel = mainLoop_kernel(backend)
+    main_kernel(referenceArrs, dilatationArrs, mainArrDims, dataBdim
+        , numberToLooFor, metaDataDims, metaData, iterThrougWarNumb, robustnessPercent
+        , shmemSumLengthMaxDiv4, globalFpResOffsetCounter, globalFnResOffsetCounter
+        , globalIterationNumber, globalCurrentFnCount, globalCurrentFpCount
+        , globalIterationNumb, workQueue, workQueueCounter
+        , loopAXFixed, loopBXfixed, loopAYFixed, loopBYfixed, loopAZFixed, loopBZfixed
+        , loopdataDimMainX, loopdataDimMainY, loopdataDimMainZ, inBlockLoopX, inBlockLoopY
+        , inBlockLoopZ, metaDataLength, loopMeta, loopWarpMeta, clearIterResShmemLoop
+        , clearIterSourceShmemLoop, resShmemTotalLength, sourceShmemTotalLength, fn, fp, resList, inBlockLoopXZIterWithPadding, paddingStore, shmemblockDataLenght, shmemblockDataLoop;
+        ndrange=(blocksMainKern * threadsMainKern[1] * threadsMainKern[2]), 
+        workgroupsize=(threadsMainKern[1] * threadsMainKern[2]))
+    
+    KernelAbstractions.synchronize(backend)
+
     return globalIterationNumb
     
     end
@@ -130,9 +137,10 @@ function preparehousedorfKernel(goldGPU,segmGPU,robustnessPercent,numberToLooFor
     threadsMainKern= (30,32); blocksMainKern = 10#just some dummy will be modified after invoking occupancy API
     iterThrougWarNumb = cld(14,threadsMainKern[2])
 
+    backend = KernelAbstractions.get_backend(goldGPU)
     inBlockLoopXZIterWithPadding,shmemblockDataLoop,shmemblockDataLenght,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength=calculateLoopsIter(dataBdim,threadsBoolKern[1],threadsBoolKern[2],metaDataDims,blocksBoolKern)
-        minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp  =getSmallForBoolKernel();
-        reducedGoldA,reducedSegmA=  getLargeForBoolKernel(mainArrDims,dataBdim);
+        minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp  =getSmallForBoolKernel(backend);
+        reducedGoldA,reducedSegmA=  getLargeForBoolKernel(backend,mainArrDims,dataBdim);
    
     loopXinPlane,loopYinPlane = 1,1
     boolKernelArgs = (mainArrDims,dataBdim,metaData,metaDataDims,reducedGoldA,reducedSegmA,loopXinPlane,loopYinPlane,minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp ,numberToLooFor,inBlockLoopXZIterWithPadding,shmemblockDataLoop,shmemblockDataLenght,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength)
@@ -192,12 +200,9 @@ function preparehousedorfKernel(goldGPU,segmGPU,robustnessPercent,numberToLooFor
     boolKernelArgs = (mainArrDims,dataBdim,metaData,metaDataDims,reducedGoldA,reducedSegmA,loopXinPlane,loopYinPlane,minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp ,numberToLooFor,inBlockLoopXZIterWithPadding,shmemblockDataLoop,shmemblockDataLenght,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength)
 
     inBlockLoopXZIterWithPadding,shmemblockDataLoop,shmemblockDataLenght,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength=calculateLoopsIter(dataBdim,threadsBoolKern[1],threadsBoolKern[2],metaDataDims,blocksBoolKern)
-   
-
-    boolKernelArgs = (mainArrDims,dataBdim,metaData,metaDataDims,reducedGoldA,reducedSegmA,loopXinPlane,loopYinPlane,minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp ,numberToLooFor,inBlockLoopXZIterWithPadding,shmemblockDataLoop,shmemblockDataLenght,loopAXFixed,loopBXfixed,loopAYFixed,loopBYfixed,loopAZFixed,loopBZfixed,loopdataDimMainX,loopdataDimMainY,loopdataDimMainZ,inBlockLoopX,inBlockLoopY,inBlockLoopZ,metaDataLength,loopMeta,loopWarpMeta,clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength,sourceShmemTotalLength)
     metaData,reducedGoldA  ,reducedSegmA ,paddingStore,resList,workQueue,workQueueCounter= getBigGPUForHousedorffAfterBoolKernel(metaData,minxRes,maxxRes,minyRes,maxyRes,minzRes,maxzRes,fn,fp,reducedGoldA,reducedSegmA,dataBdim)
     
-    reducedGoldA,reducedSegmA=  getLargeForBoolKernel(mainArrDims,dataBdim);
+    reducedGoldA,reducedSegmA=  getLargeForBoolKernel(backend,mainArrDims,dataBdim);
 
     mainKernelArgs= (referenceArrs,dilatationArrs, mainArrDims,dataBdim
     ,numberToLooFor,metaDataDims,metaData,iterThrougWarNumb,robustnessPercent

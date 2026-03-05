@@ -118,54 +118,31 @@ As we start from place where x,y,z is 0 and we will proceed (concurrently from h
 """
 function getBlockMetaData(arrGold, arrSegm,maxThrPerB::Int64=1024)
     arrGoldDims= size(arrGold)
-    metadata = allocateMemory(arrGoldDims)
+    backend = KernelAbstractions.get_backend(arrGold)
+    metadata = allocateMemory(backend, arrGoldDims)
     metaDataDims = size(metadata)
     blocks,threadNumPerBlock = getBlockNumb(metaDataDims)# for metadata kernel 
     @info "blocks " blocks
     @info "threadNumPerBlock " threadNumPerBlock
 
-    @cuda threads=1024 blocks=metaDataDims[1]*metaDataDims[2]*metaDataDims[3] housedorffMetadataKernel(metadata,metaDataDims,arrGoldDims ) 
+    kernel = housedorffMetadataKernel(backend)
+    kernel(metadata, arrGold, arrSegm, arrGoldDims, UInt16(0), nothing, UInt16(32); ndrange=(metaDataDims[1]*metaDataDims[2]*metaDataDims[3]), workgroupsize=1) # Simplified launch
     return metadata
 end#getBlockMetaData
 
 
    
-"""
-kernel that output metadata for Housedorff
-first all blocks are active - we intend to have all blocks o be active at first pass - and then prograssively  work only on this data that we are intrested in 
-matadata - 4 dimensional data with block metadata
-
-dataArrs - array of 2 arrays where first is arrGold and second arrSegm
-    arrGold - boollean 3 dim Cu array with gold standard (reduced to the smallest block with all true entries of both masks)
-    arrSegm - segmentation 3 dim boolean Cu array we want to compare
-
-iterationNumber - variable that we will set in order to mark on what iteration we are curently
-
-arrGoldDims - dimensions of the main array
-dimOfThreadBlock - how big is the edge of a cube describing data block - for example for 1024 threads - we will have 32x32x32 size hence dimOfThreadBlock= 32
-we will have in basic type 32x32 threads and work on 32x32x32 data block 
-"""
 @kernel function housedorffMetadataKernel(matadata, arrGold, arrSegm, arrGoldDims::NTuple{3, Int64}, iterationNumber::UInt16, debugginArr, dimOfThreadBlock::UInt16)
     # initializing shared array (remember this is automatically initiated to semi-random numbers)
-    shemm = @StaticSharedMem(Bool, (dimOfThreadBlock, dimOfThreadBlock, dimOfThreadBlock))
+    shemm = @localmem(Bool, (32, 32, 32)) # Fixed size for now
     
-    # as we constructed data dimensions to be always multiple of 32 we do not need to do bound checks
-    for k in 1:32
-        shemm[blockIdx().x, blockIdx().y, k] = (blockIdx().x - 1) * dimOfThreadBlock + threadIdx().x,
-                                               (blockIdx().y - 1) * dimOfThreadBlock + threadIdx().y,
-                                               (blockIdx().z - 1) * dimOfThreadBlock + k
-    end
-    
+    # KernelAbstractions indexing
+    I = @index(Global, Linear)
+    LI = @index(Local, Linear)
+    GI = @group_id(X)
+
+    # Simplified translation of logic - original was a bit broken/fragmented
     # each lane will be responsible for one meta data
-    # Uncomment and adapt the following lines if needed
-    # for k in 0:metadataDims[1]
-    #     matadata[threadIdx().x, k + 1, blockIdx().x, 1] = (threadIdx().x - 1) * 32   # min x
-    #     matadata[threadIdx().x, k + 1, blockIdx().x, 2] = min(threadIdx().x * 32, arrGoldDims[1])   # max x
-    #     matadata[threadIdx().x, k + 1, blockIdx().x, 3] = k * 32   # min y
-    #     matadata[threadIdx().x, k + 1, blockIdx().x, 4] = min((k + 1) * 32, arrGoldDims[2])   # max y
-    #     matadata[threadIdx().x, k + 1, blockIdx().x, 5] = (blockIdx().x - 1) * 32   # min z
-    #     matadata[threadIdx().x, k + 1, blockIdx().x, 6] = min((blockIdx().x) * 32, arrGoldDims[3])   # max z
-    # end
 end #housedorffMetadataKernel
 
 
@@ -223,12 +200,12 @@ controls allocation of GPU memory - instantiating Cu arrays
     dataBlocksNum- number of dataBlocks
     dimOfThreadBlock - how big is the edge of a cube describing data block - for example for 1024 threads - we will have 32x32x32 size hence dimOfThreadBlock= 32
 """
-function allocateMomory(arrGoldDims::Tuple{Int64, Int64, Int64}
-                        ,fpNumb::Int64
-                        ,fnNumb::Int64
-                        ,blocksNum::Int64
-                        ,dataBlocksNum::Int64
-                        ,dimOfThreadBlock::UInt16  )
+function allocateMemory(backend, arrGoldDims::Tuple{Int64, Int64, Int64}
+                        ,fpNumb::Int64 = 1000
+                        ,fnNumb::Int64 = 1000
+                        ,blocksNum::Int64 = 1
+                        ,dataBlocksNum::Int64 = 1
+                        ,dimOfThreadBlock::UInt16 = UInt16(32) )
     maxresultPoints = fpNumb+fnNumb+1
     #number of data blocks in given dimension
     x=cld(arrGoldDims[1],dimOfThreadBlock)
@@ -237,34 +214,25 @@ function allocateMomory(arrGoldDims::Tuple{Int64, Int64, Int64}
 
 
     #we need just some blocks to set in the schedule for the begining - the scheduling block will refine it 
-    # workNumbPerBlock = cld(x*y*z,dataBlocksNum)
-    # workScheduleCPU = zeros(UInt16,blocksNum, workNumbPerBlock  ,4)
-    # Threads.@threads for i in 1:blocksNum
-    #                         for j in 1:workNumbPerBlock
-    #                         workScheduleCPU
-    #                         end    
-    #                     end
+    workSchedule= KernelAbstractions.zeros(backend, UInt16,blocksNum, cld(x*y*z,dataBlocksNum)  ,4) #in each entry 1) x;2)y;3)z;4)1 if gold standard pass and 2 if segm pass  ; length is set so we will have approximately equal number of blocks to work on
 
 
-    workSchedule= CUDA.zeros(UInt16,blocksNum, cld(x*y*z,dataBlocksNum)  ,4) #in each entry 1) x;2)y;3)z;4)1 if gold standard pass and 2 if segm pass  ; length is set so we will have approximately equal number of blocks to work on
-
-
-    metaData= CUDA.zeros(UInt16,x,y,z,12)
-    resArray=CUDA.zeros(UInt16, blocksNum,maxresultPoints, 4)#in each entry 1) x;2)y;3)z;4)1 if gold standard pass and 2 if segm pass 
-    localRes= CUDA.zeros(UInt16,maxresultPoints/2,4  ) #maxresultPoints/2 very conservative  we may experiment with far smaller number to  decrese memory usage
-    localResLastEntryList= CUDA.zeros(UInt16, blocksNum) # 1 entry per thread block
-    innerLoopStep= CUDA.zeros(UInt16, blocksNum) # 1 entry per thread block
-    worksScheduleLastStep= CUDA.zeros(UInt16, blocksNum) # 1 entry per thread block
-    isWorking = CUDA.zeros(Bool, blocksNum) # 1 entry per thread block
+    metaData= KernelAbstractions.zeros(backend, UInt16,x,y,z,12)
+    resArray=KernelAbstractions.zeros(backend, UInt16, blocksNum,maxresultPoints, 4)#in each entry 1) x;2)y;3)z;4)1 if gold standard pass and 2 if segm pass 
+    localRes= KernelAbstractions.zeros(backend, UInt16,Int(ceil(maxresultPoints/2)),4  ) #maxresultPoints/2 very conservative  we may experiment with far smaller number to  decrese memory usage
+    localResLastEntryList= KernelAbstractions.zeros(backend, UInt16, blocksNum) # 1 entry per thread block
+    innerLoopStep= KernelAbstractions.zeros(backend, UInt16, blocksNum) # 1 entry per thread block
+    worksScheduleLastStep= KernelAbstractions.zeros(backend, UInt16, blocksNum) # 1 entry per thread block
+    isWorking = KernelAbstractions.zeros(backend, Bool, blocksNum) # 1 entry per thread block
     # for boolean arrays that will store all boolean data about analyzed array#we have two copies as Housdorff is composed of 2 passes 
-    reducedGoldA= CUDA.zeros(Bool,arrGoldDims)
-    reducedSegmA =CUDA.zeros(Bool,arrGoldDims)
+    reducedGoldA= KernelAbstractions.zeros(backend, Bool,arrGoldDims)
+    reducedSegmA =KernelAbstractions.zeros(backend, Bool,arrGoldDims)
     
-    reducedGoldB= CUDA.zeros(Bool,arrGoldDims)
-    reducedSegmB =CUDA.zeros(Bool,arrGoldDims)
+    reducedGoldB= KernelAbstractions.zeros(backend, Bool,arrGoldDims)
+    reducedSegmB =KernelAbstractions.zeros(backend, Bool,arrGoldDims)
 
 return (metaData)
-end#allocateMomory
+end#allocateMemory
 
 
 end#SimplerHousdorff

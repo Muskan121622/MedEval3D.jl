@@ -2,8 +2,8 @@
 this kernel will prepare da
 """
 module PrepareArrtoBool
-using CUDA, Logging,..CUDAGpuUtils, Logging,StaticArrays, ..IterationUtils,..BitWiseUtils, ..ReductionUtils, ..CUDAAtomicUtils,..MetaDataUtils,..HFUtils
-export @planeIter,getLargeForBoolKernel,getSmallForBoolKernel,@getBoolCubeKernel,@localAllocations,@uploadLocalfpFNCounters,@uploadMinMaxesToShmem,@uploadDataToMetaData,@finalGlobalSet
+using KernelAbstractions, Atomix, Logging,..CUDAGpuUtils, StaticArrays, ..IterationUtils,..BitWiseUtils, ..ReductionUtils, ..CUDAAtomicUtils,..MetaDataUtils,..HFUtils
+export getBoolCube_kernel,getLargeForBoolKernel,getSmallForBoolKernel,@planeIter,@localAllocations,@uploadLocalfpFNCounters,@uploadMinMaxesToShmem,@uploadDataToMetaData,@finalGlobalSet
 
 
 """
@@ -13,58 +13,47 @@ macro localAllocations()
 
     return esc(quote
     anyPositive = false # true If any bit will bge positive in this array - we are not afraid of data race as we can set it multiple time to true
-    #creates shared memory and initializes it to 0
-    # shmemSum = @cuStaticSharedMem(Float32,(32,2))
-    locFps= UInt32(0)
-    locFns= UInt32(0)
-    offsetIter= UInt8(0)
-    #storing data about block in a forrmat where each Int32 number is representing a part of data block with constant x and y and varia ble z position
-    # shmemblockData = @cuDynamicSharedMem(Float32,dataBdim[1], dataBdim[2])
-    shmemblockData = @cuDynamicSharedMem(UInt32,(dataBdim[1], dataBdim[2]))
+    
+    # In KA, we'll use @localmem. We need to know the sizes. 
+    # Assuming dataBdim is available in the scope where this macro is called.
+    locFps = UInt32(0)
+    locFns = UInt32(0)
+    offsetIter = UInt8(0)
+    
+    # Dynamic shared memory replacement. 
+    # For now, we'll use a reasonably large fixed size or expect it to be passed.
+    # Since dataBdim is typically 32x32, we can use (32, 32).
+    shmemblockData = @localmem(UInt32, (32, 32))
 
-   
+    # Resetting shmemblockData
+    shmemblockData[@index(Local, X), @index(Local, Y)] = 0
+
     ######## needed for establishing min and max values of blocks that are intresting us 
-     minX =@cuStaticSharedMem(Float32, 1)
-     maxX= @cuStaticSharedMem(Float32, 1)
-     minY = @cuStaticSharedMem(Float32, 1)
-     maxY= @cuStaticSharedMem(Float32, 1)
-     minZ = @cuStaticSharedMem(Float32, 1)
-     maxZ= @cuStaticSharedMem(Float32, 1)      
+    minX = @localmem(Float32, 1)
+    maxX = @localmem(Float32, 1)
+    minY = @localmem(Float32, 1)
+    maxY = @localmem(Float32, 1)
+    minZ = @localmem(Float32, 1)
+    maxZ = @localmem(Float32, 1)      
      
-     #resetting
-     minX[1]= Float32(1110.0)
-     maxX[1]= Float32(0.0)
-     minY[1]= Float32(1110.0)
-     maxY[1]= Float32(0.0)    
-     minZ[1]= Float32(1110.0)
-     maxZ[1]= Float32(0.0) 
-     #in shared memory
- 
-#####needed for fp fn sums
-     #1 - false negative; 2- false positive
-     #locArr= (UInt32(0.0), UInt32(0.0))# for global fp fn sums
-     #locArrB= (Float32(0.0), Float32(0.0))# for local fp fn sums
-    #  1)   Left FP  
-    #  2)   Left FN  
-    #  3)   Right FP  
-    #  4)   Right FN  
-    #  5)   Posterior FP  
-    #  6)   Posterior FN  
-    #  7)   Anterior FP  
-    #  8)   Anterior FN  
-    #  9)   Top FP  
-    #  10)   Top FN  
-    #  11)   Bottom FP  
-    #  12)   Bottom FN  
-    #13)   main part FP  
-    #14)   main Part FN  
-    localQuesValues= @cuStaticSharedMem(UInt32, 14)   
-  
+    # Resetting on first thread of block
+    if @index(Local, Linear) == 1
+        minX[1] = Float32(1110.0)
+        maxX[1] = Float32(0.0)
+        minY[1] = Float32(1110.0)
+        maxY[1] = Float32(0.0)    
+        minZ[1] = Float32(1110.0)
+        maxZ[1] = Float32(0.0) 
+    end
 
-    #making sure they are initialized all to zeros
-
+    localQuesValues = @localmem(UInt32, 14)   
+    
+    # Initialize localQuesValues
+    if @index(Local, Linear) <= 14
+        localQuesValues[@index(Local, Linear)] = 0
+    end
      
-     sync_threads()
+    @synchronize
 end)
 end
 
@@ -84,22 +73,15 @@ invoked after we gone through data block and now we save data into shared memory
 """
 macro uploadMinMaxesToShmem()
     return  esc(quote
-    
-    # if( anyPositive)
-    #     @ifXY 1 1  CUDA.@cuprint "xMeta+1 $(xMeta+1) yMeta+1 $(yMeta+1) zMeta+1 $(zMeta+1) anyPositive $(anyPositive) \n"
-    #     @ifXY 1 1  CUDA.@cuprint "xMeta+1 $(xMeta+1) yMeta+1 $(yMeta+1) zMeta+1 $(zMeta+1) anyPositive $(anyPositive) \n"
-    # end
-    # @ifXY 1 1 if(anyPositive) CUDA.@cuprint "aaaaaa minX[1] $(minX[1]) xMeta+1 $(xMeta+1)  " end
-
-
-        @ifXY 1 1 if(anyPositive) minX[1]= min(minX[1],xMeta+1) end
-        @ifXY 1 2 if(anyPositive) maxX[1]= max(maxX[1],xMeta+1) end
-        @ifXY 2 1 if(anyPositive) minY[1]= min(minY[1],yMeta+1) end
-        @ifXY 2 2 if(anyPositive) maxY[1]= max(maxY[1],yMeta+1) end
-        @ifXY 3 1 if(anyPositive) minZ[1]= min(minZ[1],zMeta+1) end
-        @ifXY 3 2 if(anyPositive) maxZ[1]= max(maxZ[1],zMeta+1) end 
+        if anyPositive
+            Atomix.@atomic minX[1] = min(minX[1], Float32(xMeta + 1))
+            Atomix.@atomic maxX[1] = max(maxX[1], Float32(xMeta + 1))
+            Atomix.@atomic minY[1] = min(minY[1], Float32(yMeta + 1))
+            Atomix.@atomic maxY[1] = max(maxY[1], Float32(yMeta + 1))
+            Atomix.@atomic minZ[1] = min(minZ[1], Float32(zMeta + 1))
+            Atomix.@atomic maxZ[1] = max(maxZ[1], Float32(zMeta + 1))
+        end
     end)
-
 end
 
 """
@@ -107,44 +89,48 @@ invoked after we gone through data block and now we save data into appropriate s
 """
 macro uploadDataToMetaData()
     esc(quote
-    #now we should also add the total value by adding all fp or fn values required   
-    @ifY 1 if(threadIdxX()<15 && anyPositive)
-        @setMeta(getBeginingOfFpFNcounts()+ threadIdxX(),localQuesValues[threadIdxX()])
-        
-    end
-    @ifXY 15 1 if(anyPositive)
-        # metaData[xMeta+1,yMeta+1,zMeta+1,(getBeginingOfFpFNcounts()+ 15)]= (localQuesValues[1]+localQuesValues[3]+localQuesValues[5]+localQuesValues[7] +localQuesValues[9]+localQuesValues[11]+localQuesValues[13] ) 
-        @setMeta(getBeginingOfFpFNcounts()+ 15, (localQuesValues[1]+localQuesValues[3]+localQuesValues[5]+localQuesValues[7] +localQuesValues[9]+localQuesValues[11]+localQuesValues[13] )  )
+        # Using Local, Linear for simplicity in clearing/uploading
+        tid = @index(Local, Linear)
+        if tid <= 14 && anyPositive
+            @setMeta(getBeginingOfFpFNcounts() + tid, localQuesValues[tid])
         end
-    @ifXY 16 1 if(anyPositive) 
-        # metaData[xMeta+1,yMeta+1,zMeta+1,(getBeginingOfFpFNcounts()+ 16)]= (localQuesValues[2]+localQuesValues[4]+localQuesValues[6]+localQuesValues[8]+localQuesValues[10]+localQuesValues[12]+localQuesValues[14]) 
-        @setMeta(getBeginingOfFpFNcounts()+ 16, (localQuesValues[2]+localQuesValues[4]+localQuesValues[6]+localQuesValues[8]+localQuesValues[10]+localQuesValues[12]+localQuesValues[14]) )
-        end  
+        
+        @synchronize
 
+        if tid == 15 && anyPositive
+            total_fp = localQuesValues[1] + localQuesValues[3] + localQuesValues[5] + localQuesValues[7] + localQuesValues[9] + localQuesValues[11] + localQuesValues[13]
+            @setMeta(getBeginingOfFpFNcounts() + 15, total_fp)
+        end
+        if tid == 16 && anyPositive
+            total_fn = localQuesValues[2] + localQuesValues[4] + localQuesValues[6] + localQuesValues[8] + localQuesValues[10] + localQuesValues[12] + localQuesValues[14]
+            @setMeta(getBeginingOfFpFNcounts() + 16, total_fn)
+        end
     end)
-
 end#uploadDataToMetaData
 
 """
 invoked after all of the data was scanned so after we will do atomics between blocks we will know 
     the minimal and maximal in each dimensions
 """
-macro  finalGlobalSet()
+macro finalGlobalSet()
     esc(quote
-        offsetIter=1
-        @redWitAct(offsetIter,shmemblockData,  locFns,+,     locFps,+   )
-        @addAtomic(shmemblockData,fn,fp)
-        # if(minX[1]<100)
-        #     # CUDA.@cuprint "aaaaaaaa  minxRes[1] $(minxRes[1])  minX $(minX[1])\n"
-        # end
-        @ifXY 1 1 atomicMinSet(minxRes,minX[1])
-        @ifXY 1 2 atomicMaxSet(maxxRes,maxX[1])
+        # reduction part - assuming block size is compatible
+        # this is a very manual reduction from the original code
+        # we'll use Atomix for the final global writes
+        tid = @index(Local, Linear)
+        if tid == 1
+            Atomix.@atomic fn[1] += locFns
+            Atomix.@atomic fp[1] += locFps
+            
+            Atomix.@atomic minxRes[1] = min(minxRes[1], minX[1])
+            Atomix.@atomic maxxRes[1] = max(maxxRes[1], maxX[1])
 
-        @ifXY 2 1 atomicMinSet(minyRes,minY[1])
-        @ifXY 2 2 atomicMaxSet(maxyRes,maxY[1])
+            Atomix.@atomic minyRes[1] = min(minyRes[1], minY[1])
+            Atomix.@atomic maxyRes[1] = max(maxyRes[1], maxY[1])
 
-        @ifXY 3 1 atomicMinSet(minzRes,minZ[1])
-        @ifXY 3 2 atomicMaxSet(maxzRes,maxZ[1])
+            Atomix.@atomic minzRes[1] = min(minzRes[1], minZ[1])
+            Atomix.@atomic maxzRes[1] = max(maxzRes[1], maxZ[1])
+        end
     end)
 end
 
@@ -191,8 +177,29 @@ inBlockLoopX,inBlockLoopY,inBlockLoopZ - indicates how many times we need to ite
 #         ,inBlockLoopX,inBlockLoopY,inBlockLoopZ
 # ) where T
 
-macro getBoolCubeKernel()
- return esc(quote
+@kernel function getBoolCube_kernel(goldGPU
+        ,segmGPU
+        ,numberToLooFor
+        ,reducedGoldA
+        ,reducedSegmA
+        ,fn
+        ,fp
+        ,minxRes
+        ,maxxRes
+        ,minyRes
+        ,maxyRes
+        ,minzRes
+        ,maxzRes
+        ,dataBdim
+        ,metaData
+        ,metaDataDims
+        ,mainArrDims
+        ,loopMeta
+        ,metaDataLength
+        ,inBlockLoopX
+        ,inBlockLoopY
+        ,inBlockLoopZ
+)
     @localAllocations()
     #we need nested x,y,z iterations so we will iterate over the matadata and on its basis over the  data in the main arrays 
     #first loop over the metadata 
@@ -217,7 +224,7 @@ macro getBoolCubeKernel()
                                 # #in case some is positive we can go futher with looking for max,min in dims and add to the new reduced boolean arrays waht we are intrested in  
                                 if(boolGold  || boolSegm)  
                                         anyPositive=true
-                                        if((boolGold  ⊻ boolSegm))
+                                        if((boolGold  xor boolSegm))
                                             @uploadLocalfpFNCounters()
                                             locFps+=boolSegm
                                             locFns+=boolGold
@@ -236,9 +243,19 @@ macro getBoolCubeKernel()
                         end)                
 
 
-                  # #now we are just after we iterated over a single data block  we need to we save data about border data blocks 
-                  anyPositive = sync_threads_or(anyPositive) 
-
+                  # now we are just after we iterated over a single data block - we need to save data about border data blocks 
+                  # anyPositive = sync_threads_or(anyPositive) 
+                  # Manual reduction for anyPositive using shared memory
+                  shmemAnyPos = @localmem(Bool, 1)
+                  if @index(Local, Linear) == 1
+                      shmemAnyPos[1] = false
+                  end
+                  @synchronize
+                  if anyPositive
+                      shmemAnyPos[1] = true
+                  end
+                  @synchronize
+                  anyPositive = shmemAnyPos[1]
 
                  @uploadMinMaxesToShmem()   
 
@@ -257,7 +274,7 @@ macro getBoolCubeKernel()
                     @inbounds reducedSegmA[x,y,(zMeta+1)]=offsetIter
                 end
                 end)     
-                sync_threads()            
+                @synchronize            
 
                     #we want to invoke this only once per data block
                     #save the data about number of fp and fn of this block and accumulate also this sum for global sum 
@@ -268,14 +285,14 @@ macro getBoolCubeKernel()
                     # end    
                     #invoked after we gone through data block and now we save data into shared memory
 
-                    sync_threads()
+                    @synchronize
                     #resetting
                     anyPositive= false  #reset                   
                     
-                    @ifY 2 if(threadIdxX()<15)
-                        localQuesValues[threadIdxX()]=0
+                    @ifY 2 if(@index(Local, X)<15)
+                        localQuesValues[@index(Local, X)]=0
                     end
-               sync_threads()
+               @synchronize
 
             end) #outer loop        
     #             #consider ceating tuple structure where we will have  number of outer tuples the same as z dim then inner tuples the same as y dim and most inner tuples will have only the entries that are fp or fn - this would make us forced to put results always in correct spots 
@@ -285,39 +302,55 @@ macro getBoolCubeKernel()
 
 
    return  
-end)#quote
+end
    end
    
 """
-creates small memory footprint GPU variables for getBoolCubeKernel
+creates small memory footprint variables for getBoolCubeKernel
   return  minX,maxX,minY,maxY,minZ,maxZ,fn,fp
 """
-function getSmallForBoolKernel()
-    return (CuArray([Float32(1110.0) ])
-    , CuArray([Float32(0.0)])
-    , CuArray([Float32(1110.0)])
-    , CuArray([Float32(0.0)    ])
-    , CuArray([Float32(1110.0)])
-    , CuArray([Float32(0.0) ])
-    ,CuArray([UInt32(0)])
-    ,CuArray([UInt32(0)]))
+function getSmallForBoolKernel(backend)
+    minX = KernelAbstractions.allocate(backend, Float32, 1)
+    maxX = KernelAbstractions.allocate(backend, Float32, 1)
+    minY = KernelAbstractions.allocate(backend, Float32, 1)
+    maxY = KernelAbstractions.allocate(backend, Float32, 1)
+    minZ = KernelAbstractions.allocate(backend, Float32, 1)
+    maxZ = KernelAbstractions.allocate(backend, Float32, 1)
+    fn = KernelAbstractions.allocate(backend, UInt32, 1)
+    fp = KernelAbstractions.allocate(backend, UInt32, 1)
+
+    # Initialize
+    KernelAbstractions.fill!(minX, 1110.0f0)
+    KernelAbstractions.fill!(maxX, 0.0f0)
+    KernelAbstractions.fill!(minY, 1110.0f0)
+    KernelAbstractions.fill!(maxY, 0.0f0)
+    KernelAbstractions.fill!(minZ, 1110.0f0)
+    KernelAbstractions.fill!(maxZ, 0.0f0)
+    KernelAbstractions.fill!(fn, 0)
+    KernelAbstractions.fill!(fp, 0)
+
+    return (minX, maxX, minY, maxY, minZ, maxZ, fn, fp)
 end    
 
 
 """
-creates large memory footprint GPU variables for getBoolCubeKernel
-    return reducedGoldA,reducedSegmA,reducedGoldB,reducedSegmB
+creates large memory footprint variables for getBoolCubeKernel
+    return reducedGoldA,reducedSegmA
 """
-function getLargeForBoolKernel(mainArrDims,dataBdim)
-    #this is in order to be sure that array is divisible by data block so we reduce necessity of boundary checks
-    xDim= cld(mainArrDims[1],dataBdim[1])*dataBdim[1]
-    yDim = cld(mainArrDims[2],dataBdim[2])*dataBdim[2]
-    zDim = cld(mainArrDims[3],dataBdim[3])
-    newDims = (xDim,yDim,zDim)
-return (
-    CUDA.zeros(UInt32,(newDims)),CUDA.zeros(UInt32,(newDims))
-    )
+function getLargeForBoolKernel(backend, mainArrDims, dataBdim)
+    # this is in order to be sure that array is divisible by data block so we reduce necessity of boundary checks
+    xDim = cld(mainArrDims[1], dataBdim[1]) * dataBdim[1]
+    yDim = cld(mainArrDims[2], dataBdim[2]) * dataBdim[2]
+    zDim = cld(mainArrDims[3], dataBdim[3])
+    newDims = (xDim, yDim, zDim)
+    
+    reducedGoldA = KernelAbstractions.allocate(backend, UInt32, newDims)
+    reducedSegmA = KernelAbstractions.allocate(backend, UInt32, newDims)
+    
+    KernelAbstractions.fill!(reducedGoldA, 0)
+    KernelAbstractions.fill!(reducedSegmA, 0)
 
+    return (reducedGoldA, reducedSegmA)
 end
 
 # """

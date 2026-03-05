@@ -1,5 +1,5 @@
 module MainLoopKernel
-using CUDA, Logging,..CUDAGpuUtils, ..ResultListUtils,..WorkQueueUtils,..ScanForDuplicates, Logging,StaticArrays, ..IterationUtils, ..ReductionUtils, ..CUDAAtomicUtils,..MetaDataUtils
+using KernelAbstractions, Atomix, CUDA, Logging,..CUDAGpuUtils, ..ResultListUtils,..WorkQueueUtils,..ScanForDuplicates, Logging,StaticArrays, ..IterationUtils, ..ReductionUtils, ..CUDAAtomicUtils,..MetaDataUtils
 using ..BitWiseUtils,..MetadataAnalyzePass, ..ScanForDuplicates, ..ProcessMainDataVerB
 export mainKernelLoad,@mainLoopKernelAllocations,getSmallGPUForHousedorff,getBigGPUForHousedorffAfterBoolKernel,@loadDataAtTheBegOfDilatationStep,@mainLoopKernel, @iterateOverWorkQueue,@mainLoop,@mainLoopKernelAllocations,@clearBeforeNextDilatation
 
@@ -13,18 +13,9 @@ resShmemTotalLength, sourceShmemTotalLength - total (treating as 1 dimensional a
 macro clearBeforeNextDilatation( clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength, sourceShmemTotalLength,dataBdim)
     return esc(quote
     isMaskFull=true
-    # @ifXY 1 1  CUDA.@cuprint "rrrr $(resShmem[10,10,10]) \n" #lll $(length(resShmem)) \n"
-    #  for i in 1:length(resShmem) #resShmemTotalLength-1
-    #     resShmem[i]=false
-    #  end    
-    # @iterateLinearly clearIterResShmemLoop resShmemTotalLength  resShmem[i]=false
-    # @iterateLinearly clearIterSourceShmemLoop sourceShmemTotalLength  sourceShmem[i]=false
-    # @iterateLinearly clearIterResShmemLoop 34*20*34  resShmem[i]=false
-    # @iterateLinearly clearIterSourceShmemLoop 34*20*34  sourceShmem[i]=false
-    
 
-    @ifY 1 if(threadIdxX()<15) areToBeValidated[threadIdxX()]=false end 
-    @ifY 2 if(threadIdxX()<8) isAnythingInPadding[threadIdxX()]=false end 
+    @ifY 1 if(@index(Local, X)<15) areToBeValidated[@index(Local, X)]=false end 
+    @ifY 2 if(@index(Local, X)<8) isAnythingInPadding[@index(Local, X)]=false end 
    
 
 end)#quote
@@ -36,71 +27,52 @@ end#clearBeforeNextDilatation
 """
 allocates memory in the kernel some register and shared memory  (no allocations in global memory here from kernel)
 dataBdim - are dimensions of data block - each data block has just one row in the metadata ...
-
 """
 macro mainLoopKernelAllocations(dataBdim)
     return esc(quote
-#needed to manage cooperative groups functions
-grid_handle = this_grid()
+        # shmemblockData = @localmem(UInt32, (32, 32, 2))
+        # holding data about result  2)bottom, 3)left 4)right , 5)anterior, 6)posterior , 7) top,  paddings
+        shmemPaddings = @localmem(Bool, (32, 32, 7))
 
-shmemblockData = @cuDynamicSharedMem(UInt32,($dataBdim[1], $dataBdim[2] ,2))
-#shmemblockData = @cuStaticSharedMem(Int32,(32, 32 ,2))
-# holding values of results
-# resShmemblockData = @cuDynamicSharedMem(UInt32,($dataBdim[1], $dataBdim[2] ))
+        # for storing sums for reductions
+        shmemSum = @localmem(UInt32, (36, 16)) # we need this additional spots
+        # used to load from metadata information are ques to be validated 
+        areToBeValidated = @localmem(Bool, 14) 
+        # used to mark wheather there is any true in paddings
+        isAnythingInPadding = @localmem(Bool, 7)
+        # used to accumulate counts from of fp's and fn's already covered in dilatation steps
+        alreadyCoveredInQueues = @localmem(UInt32, 14)
+         
+        # boolean usefull in the iterating over private part of work queue 
+        isAnyBiggerThanZero = @localmem(Bool, 1)
+        # loading data to shared memory from global about is it even or odd pass
+        iterationNumberShmem = @localmem(UInt16, 1)
+        # shared memory variables needed to marks wheather we are already finished with  any dilatation step
+        goldToBeDilatated = @localmem(Bool, 1)
+        segmToBeDilatated = @localmem(Bool, 1)
+        # true when we have more than 0 blocks to analyze in next iteration
+        isEvenPass = @localmem(Bool, 1) 
+        # keeping information  weather we have not odd or even pass
+        workCounterBiggerThan0 = @localmem(Bool, 1) 
+        # holding values of  work queue counter ghlobal 
+        workCounterInshmem = @localmem(UInt16, 1)
+        # workCounter of this block - thread local
+        workCounterLocalInShmem = @localmem(UInt16, 1)
+        # helper variable used to add data to global counter
+        workCounterHelper = @localmem(UInt16, 1)
+        positionInMainWorkQueaue = @localmem(UInt16, 1)
 
-# holding data about result  2)bottom, 3)left 4)right , 5)anterior, 6)posterior , 7) top,  paddings
-shmemPaddings = @cuStaticSharedMem(Bool,( 32,32,7 ))
-
-
-#for storing sums for reductions
-shmemSum =  @cuStaticSharedMem(UInt32,(36,16)) # we need this additional spots
-#used to load from metadata information are ques to be validated 
-areToBeValidated =  @cuStaticSharedMem(Bool, (14)) 
-# used to mark wheather there is any true in paddings
-isAnythingInPadding =  @cuStaticSharedMem(Bool, (7))
-# used to accumulate counts from of fp's and fn's already covered in dilatation steps
-alreadyCoveredInQueues =@cuStaticSharedMem(UInt32,(14))
- 
- #coordinates of data in main array
- #we will use this to establish weather we should mark  the data block as empty or full ...
- isMaskFull= true
- #here we will store in registers data uploaded from mask for later verification wheather we should send it or not
-#  locArr= UInt32(0)
- offsetIter = UInt32(0)
-#  localOffset= UInt32(0)
- #boolean usefull in the iterating over private part of work queue 
- isAnyBiggerThanZero =  @cuStaticSharedMem(Bool,1)
- #loading data to shared memory from global about is it even or odd pass
- iterationNumberShmem =  @cuStaticSharedMem(UInt16,1)
- #current spot in tail - usefull to save where we need to access the tail to get proper block
- #shared memory variables needed to marks wheather we are already finished with  any dilatation step
- goldToBeDilatated =  @cuStaticSharedMem(Bool,1)
- segmToBeDilatated =  @cuStaticSharedMem(Bool,1)
- #true when we have more than 0 blocks to analyze in next iteration
- isEvenPass =  @cuStaticSharedMem(Bool,1) 
- #keeping information  weather we have not odd or even pass
- workCounterBiggerThan0 =  @cuStaticSharedMem(Bool,1) 
- #holding values of  work queue counter ghlobal 
- workCounterInshmem= @cuStaticSharedMem(UInt16,1)
- #workCounter of this block - thread local
- workCounterLocalInShmem = @cuStaticSharedMem(UInt16,1)
- # helper variable used to add data to global counter
-workCounterHelper = @cuStaticSharedMem(UInt16,1)
-
- positionInMainWorkQueaue= @cuStaticSharedMem(UInt16,1)
- @ifXY 1 1 iterationNumberShmem[1]= 0
- @ifXY 2 1 isAnyBiggerThanZero[1]= 0
- @ifXY 3 1 workCounterInshmem[1]= 0
- @ifXY 7 1 goldToBeDilatated[1]= 0
- @ifXY 8 1 segmToBeDilatated[1]= 0
- @ifXY 9 1 workCounterBiggerThan0[1]= 0
- @ifXY 19 1 isEvenPass[1]= true# set to true becouse it would be altered befor first dilatation step
- 
-
- sync_threads()
-
-end)#quote
-end    
+        @ifXY 1 1 iterationNumberShmem[1] = 0
+        @ifXY 2 1 isAnyBiggerThanZero[1] = 0
+        @ifXY 3 1 workCounterInshmem[1] = 0
+        @ifXY 7 1 goldToBeDilatated[1] = 0
+        @ifXY 8 1 segmToBeDilatated[1] = 0
+        @ifXY 9 1 workCounterBiggerThan0[1] = 0
+        @ifXY 19 1 isEvenPass[1] = true
+        
+        @synchronize
+    end)
+end
 
 
 
@@ -115,7 +87,7 @@ macro mainLoop()
 
     @loadDataAtTheBegOfDilatationStep()
 
-    sync_threads()
+    @synchronize
     
     #now we should have all data needed to analyze padding from previous dilatation
     @iterateOverWorkQueue(begin     
@@ -129,7 +101,7 @@ macro mainLoop()
         )
 
     end ) 
-   sync_grid(grid_handle)
+    # sync_grid(grid_handle) # KA doesn't support grid sync; need to handle via separate kernel launches if needed
 
     #we get dilatation from block its padding will be analyzed later
     @iterateOverWorkQueue(begin 
@@ -143,11 +115,11 @@ macro mainLoop()
         ,iterationNumberShmem[1]#iterNumb
     )
     end ) 
-    sync_grid(grid_handle)
+    # sync_grid(grid_handle)
     #every time we are overwriting work queaue
-    workQueueCounter[1]=0
+    @ifXY 1 1 workQueueCounter[1]=0
     
-    sync_grid(grid_handle)
+    # sync_grid(grid_handle)
 
      MetadataAnalyzePass.@setMEtaDataOtherPasses(locArr,offsetIter,iterationNumberShmem[1])
 
@@ -173,13 +145,13 @@ macro iterateOverWorkQueue(ex )
     # we will treat shmemSum as 1 dimensional array and write data from work queue
     #mod 1 - xMeta, mod 2 - uMeta, mod 3 - zMeta mod 4 - isGoldPass
     #first we need to  establish how many items in work queue will be analyzed by this block 
-   numbOfDataBlockPerThreadBlock = cld(workQueueCounter[1],gridDimX() )
+   numbOfDataBlockPerThreadBlock = cld(workQueueCounter[1],@numgroups()[1] )
 
     #we need to stuck all of the blocks data into shared memory 4 entries for each block
     @unroll for outerIter in 0: fld((numbOfDataBlockPerThreadBlock*4),shmemSumLengthMaxDiv4)
-        workQuueueLinearIndexOffset = ((((numbOfDataBlockPerThreadBlock)*4 ))*(blockIdxX()-1))+ (outerIter*shmemSumLengthMaxDiv4)
+        workQuueueLinearIndexOffset = ((((numbOfDataBlockPerThreadBlock)*4 ))*(@group_id(X)-1))+ (outerIter*shmemSumLengthMaxDiv4)
         # now we load all needed data into shared memory
-        @iterateLinearly cld(shmemSumLengthMaxDiv4,blockDimX()*blockDimY()) shmemSumLengthMaxDiv4 begin
+        @iterateLinearly cld(shmemSumLengthMaxDiv4,@groupsize()[1]*@groupsize()[2]) shmemSumLengthMaxDiv4 begin
             #checking if we are in range
             if(i<=shmemSumLengthMaxDiv4 )
                 if( ((outerIter*shmemSumLengthMaxDiv4)+i)<=((numbOfDataBlockPerThreadBlock*4)) && (workQuueueLinearIndexOffset +i)<=(workQueueCounter[1]*4)  )
@@ -190,7 +162,7 @@ macro iterateOverWorkQueue(ex )
             end
             
         end
-        sync_threads()
+        @synchronize
     #at this point we had pushed into shared memory as much data as we can fit so we need to start using it         
     #second part proper iteration by definition no rounding needed here 
     #also we do not make here any attempt of parallelization as this will be done inside the expression we just provide actual metadata for dilatation step
@@ -214,38 +186,38 @@ end
 """
 main kernel managing 
 """
-macro mainLoopKernel()
-  return esc(quote
-
-
+@kernel function mainLoop_kernel(referenceArrs, dilatationArrs, mainArrDims, dataBdim
+    , numberToLooFor, metaDataDims, metaData, iterThrougWarNumb, robustnessPercent
+    , shmemSumLengthMaxDiv4, globalFpResOffsetCounter, globalFnResOffsetCounter
+    , globalIterationNumber, globalCurrentFnCount, globalCurrentFpCount
+    , globalIterationNumb, workQueue, workQueueCounter
+    , loopAXFixed, loopBXfixed, loopAYFixed, loopBYfixed, loopAZFixed, loopBZfixed
+    , loopdataDimMainX, loopdataDimMainY, loopdataDimMainZ, inBlockLoopX, inBlockLoopY
+    , inBlockLoopZ, metaDataLength, loopMeta, loopWarpMeta, clearIterResShmemLoop
+    , clearIterSourceShmemLoop, resShmemTotalLength, sourceShmemTotalLength, fn, fp, resList, inBlockLoopXZIterWithPadding, paddingStore, shmemblockDataLenght, shmemblockDataLoop)
+    
     @mainLoopKernelAllocations(dataBdim)
 
     @clearBeforeNextDilatation(clearIterResShmemLoop,clearIterSourceShmemLoop,resShmemTotalLength, sourceShmemTotalLength,dataBdim)    
     
     MetadataAnalyzePass.@analyzeMetadataFirstPass()
 
-    sync_grid(grid_handle)   
+    # sync_grid(grid_handle)   
 
 
-  @loadDataAtTheBegOfDilatationStep()
+    @loadDataAtTheBegOfDilatationStep()
 
-    sync_grid(grid_handle)   
-   #we check first wheather next dilatation step should be done or not we also establish some shared memory variables to know wheather both passes should continue or just one
-    # checking weather we already finished so we need to check    
-    # - is amount of results related to gold mask dilatations is equal to false positives or given percent of them
-    # - is amount of results related to other  mask dilatations is equal to false negatives or given percent of them
-    # - is amount of workQueue that we will want to analyze now is bigger than 0 
-
-   #while((goldToBeDilatated[1] || segmToBeDilatated[1]) && workCounterBiggerThan0[1])
+    # sync_grid(grid_handle)   
     for i in 1:11
-        @ifXY 1 1 if(blockIdxX()==1) CUDA.@cuprint " goldToBeDilatated[1] $(goldToBeDilatated[1])  segmToBeDilatated[1] $(segmToBeDilatated[1]) workCounterBiggerThan0[1] $(workCounterBiggerThan0[1]) iterationNumberShmem[1] $(iterationNumberShmem[1]) \n" end
         @mainLoop()
     end     
-   #end#while we did not yet finished
-    #this will basically give the main result 
-    globalIterationNumb[1]=iterationNumberShmem[1]     
-end)#quote
+    @ifXY 1 1 globalIterationNumb[1]=iterationNumberShmem[1]     
+end
 
+macro mainLoopKernel()
+  return esc(quote
+    # This macro is now deprecated in favor of mainLoop_kernel
+end)#quote
 end
 
 
